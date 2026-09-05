@@ -1,0 +1,158 @@
+pipeline {
+
+    agent any
+
+    parameters {
+        choice(
+            name: 'GIT_BRANCH',
+            choices: ['master', 'test-branch'],
+            description: 'Select the Git branch to build'
+        )
+    }
+
+    environment {
+        BRANCH_NAME = "${params.GIT_BRANCH}"
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                echo "Checking out branch: ${params.GIT_BRANCH}"
+
+                git branch: "${params.GIT_BRANCH}",
+                    url: 'https://github.com/opstree/spring3hibernate.git'
+            }
+        }
+
+        stage('Show Current Branch') {
+            steps {
+                echo "Current Branch: ${env.BRANCH_NAME}"
+            }
+        }
+
+        stage('Gitleaks') {
+            steps {
+                sh '''
+                    gitleaks detect \
+                        --source . \
+                        --verbose \
+                        --report-path gitleaks-report.json || true
+                '''
+            }
+        }
+
+        stage('Compilation') {
+            steps {
+                withEnv([
+                    'JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64',
+                    'PATH+JAVA=/usr/lib/jvm/java-11-openjdk-amd64/bin'
+                ]) {
+                    sh '''
+                        java -version
+                        mvn -version
+
+                        mvn clean compile \
+                            -Dmaven.compiler.source=1.8 \
+                            -Dmaven.compiler.target=1.8
+                    '''
+                }
+            }
+        }
+
+        stage('Tests and Dependency Check') {
+
+            parallel {
+
+                stage('Dependency Check') {
+                    steps {
+                        sh '''
+                            /opt/dependency-check/dependency-check/bin/dependency-check.sh \
+                                --project "spring3hibernate" \
+                                --scan . \
+                                --format HTML \
+                                --out dependency-check-report \
+                                --noupdate
+                        '''
+                    }
+                }
+
+                stage('Unit Test') {
+                    steps {
+                        withEnv([
+                            'JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64',
+                            'PATH+JAVA=/usr/lib/jvm/java-11-openjdk-amd64/bin',
+                            'MAVEN_OPTS=--add-opens=java.base/java.lang=ALL-UNNAMED'
+                        ]) {
+                            sh '''
+                                mvn test \
+                                    -Dmaven.compiler.source=1.8 \
+                                    -Dmaven.compiler.target=1.8
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Package Approval') {
+            steps {
+                input(
+                    message: "Do you want to build Maven package for ${params.GIT_BRANCH}?",
+                    ok: 'Yes, Build Package'
+                )
+            }
+        }
+
+        stage('Package') {
+            steps {
+                withEnv([
+                    'JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64',
+                    'PATH+JAVA=/usr/lib/jvm/java-11-openjdk-amd64/bin'
+                ]) {
+                    sh '''
+                        mvn package \
+                            -DskipTests \
+                            -Dmaven.compiler.source=1.8 \
+                            -Dmaven.compiler.target=1.8
+                    '''
+                }
+            }
+        }
+
+        stage('Create Tag') {
+            when {
+                branch 'master'
+            }
+
+            steps {
+                echo "Master branch detected. Creating tag..."
+
+                sh '''
+                    git config user.name "Jenkins"
+                    git config user.email "jenkins@example.com"
+
+                    TAG_NAME="build-${BUILD_NUMBER}"
+
+                    git tag "$TAG_NAME"
+
+                    echo "Created Git tag: $TAG_NAME"
+                '''
+            }
+        }
+    }
+
+    post {
+        always {
+            archiveArtifacts(
+                artifacts: 'gitleaks-report.json',
+                allowEmptyArchive: true
+            )
+
+            archiveArtifacts(
+                artifacts: 'dependency-check-report/dependency-check-report.html',
+                allowEmptyArchive: true
+            )
+        }
+    }
+}
